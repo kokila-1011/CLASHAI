@@ -26,7 +26,7 @@ const PORT = process.env.PORT ?? 3001;
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
-app.use(cors({ origin: "http://localhost:5173" })); // Vite default port
+app.use(cors({ origin: ["http://localhost:5173", "http://localhost:5174"] })); // Vite default and fallback ports
 app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -39,16 +39,14 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
  * Opens a persistent SSE stream and runs the multi-agent debate.
  */
 app.post("/api/debate", async (req, res) => {
+  console.log("[server] Received request on /api/debate");
   const { decision } = req.body;
 
   if (!decision || typeof decision !== "string" || !decision.trim()) {
     return res.status(400).json({ error: "Missing or empty `decision` in request body." });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: "GEMINI_API_KEY is not configured on the server." });
-  }
+  // No API key required for Ollama (it runs locally).
 
   // ── SSE headers ────────────────────────────────────────────────────────────
   res.setHeader("Content-Type", "text/event-stream");
@@ -63,7 +61,7 @@ app.post("/api/debate", async (req, res) => {
   };
 
   try {
-    for await (const event of runDebate(decision.trim(), apiKey)) {
+    for await (const event of runDebate(decision.trim())) {
       send(event);
       if (event.type === "debate_end" || event.type === "error") break;
     }

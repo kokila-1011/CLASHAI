@@ -29,7 +29,7 @@
  *   { type: "error",        message }
  */
 
-import { GoogleGenAI } from "@google/genai";
+import ollama from "ollama";
 import { AGENTS } from "./agents.js";
 import {
   extractSearchQuery,
@@ -37,11 +37,10 @@ import {
   formatSourcesForPrompt,
 } from "./services/tavily.js";
 
-const MAX_ROUNDS = 3;
-const MODEL = "gemini-2.0-flash";
+const MAX_ROUNDS = 1;
+const MODEL = "llama3.2"; // 2GB model – smaller and faster than llama3 (4.7GB)
 
-export async function* runDebate(decision, apiKey) {
-  const genai = new GoogleGenAI({ apiKey });
+export async function* runDebate(decision) {
 
   // Shared conversation history – grows each turn.
   const history = [];
@@ -68,7 +67,7 @@ export async function* runDebate(decision, apiKey) {
         const tavilyKey = process.env.TAVILY_API_KEY;
 
         try {
-          const query = await extractSearchQuery(history, genai, MODEL);
+          const query = await extractSearchQuery(history);
           console.log(`[tavily] searching for: "${query}"`);
 
           const results = await searchTavily(query, tavilyKey);
@@ -93,48 +92,77 @@ export async function* runDebate(decision, apiKey) {
       // ─────────────────────────────────────────────────────────────────────
 
       let streamSuccess = false;
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          const chat = genai.chats.create({
+          // Format Gemini-style history to Ollama-style messages
+          const ollamaMessages = [
+            { role: "system", content: factCheckerSystemPrompt },
+            ...history.map(h => ({
+              role: h.role === "model" ? "assistant" : "user",
+              content: h.parts[0].text
+            })),
+            { role: "user", content: "Your turn." }
+          ];
+
+          const streamPromise = ollama.chat({
             model: MODEL,
-            config: {
-              systemInstruction: factCheckerSystemPrompt,
-            },
-            history: history.slice(),
+            messages: ollamaMessages,
+            stream: true,
           });
 
-          // Timeout the start of the request (TTFT)
+          // Timeout increased to 30s to handle slower responses
           const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("Gemini API timeout")), 15000)
+            setTimeout(() => reject(new Error("Ollama API timeout")), 30000)
           );
-          const streamPromise = chat.sendMessageStream({ message: "Your turn." });
           
           const stream = await Promise.race([streamPromise, timeoutPromise]);
 
-          for await (const chunk of stream) {
-            const text = chunk.text ?? "";
-            if (text) {
-              fullReply += text;
-              yield { type: "agent_chunk", agentId: agent.id, chunk: text };
+          // Buffer the full reply first for Moderator (to strip JSON), stream directly for others
+          if (agent.id === "moderator") {
+            for await (const chunk of stream) {
+              const text = chunk.message?.content ?? "";
+              if (text) fullReply += text;
+            }
+            // Strip trailing JSON consensus block before showing to user
+            const cleanReply = fullReply
+              .replace(/\{\s*"consensus"\s*:\s*(true|false)\s*\}\s*$/i, "")
+              .trim();
+            yield { type: "agent_chunk", agentId: agent.id, chunk: cleanReply };
+          } else {
+            for await (const chunk of stream) {
+              const text = chunk.message?.content ?? "";
+              if (text) {
+                fullReply += text;
+                yield { type: "agent_chunk", agentId: agent.id, chunk: text };
+              }
             }
           }
           streamSuccess = true;
           break; // Success, exit retry loop
         } catch (err) {
-          console.warn(`[orchestrator] Gemini attempt ${attempt} failed for ${agent.name}:`, err.message);
-          if (attempt === 1) {
+          console.warn(`[orchestrator] Ollama attempt ${attempt} failed for ${agent.name}:`, err.message);
+
+          if (attempt < 3) {
+            console.log(`[orchestrator] Waiting 2s before retry ${attempt + 1}...`);
+            await new Promise(r => setTimeout(r, 2000));
             fullReply = ""; // Reset for retry
+          } else {
+            throw err;
           }
         }
       }
 
       if (!streamSuccess) {
+        // Only happens if stream somehow completes but streamSuccess wasn't set, fallback just in case
         const fallbackMsg = `*(Network timeout: ${agent.name} could not respond this round)*`;
         fullReply = fallbackMsg;
         yield { type: "agent_chunk", agentId: agent.id, chunk: fallbackMsg };
       }
 
       yield { type: "agent_end", agentId: agent.id };
+
+      // Artificial 1.5s gap between agent turns to pace the debate and avoid hitting rate limits instantly
+      await new Promise(r => setTimeout(r, 1500));
 
       // Append this agent's reply to shared history.
       history.push({
@@ -164,83 +192,98 @@ export async function* runDebate(decision, apiKey) {
   }
 
   // ── Final Verdict Synthesis ───────────────────────────────────────────────
-  yield { type: "agent_start", agentId: "synthesizer", agentName: "Synthesizer" }; // Optional: signals UI that synthesis is happening
 
-  const verdictPrompt = `You are a neutral synthesizer. The debate has concluded.
-Review the transcript and provide a final verdict.
-Summarize the strongest points on each side, note any unresolved factual disputes, and output a final recommendation.
-Assign a confidence score (0-100) reflecting how clear-cut the decision is.
-
-You MUST respond with ONLY valid JSON and absolutely nothing else. No markdown fences, no preamble, no explanation.
-Use exactly this schema:
-{
-  "verdict": "short summary of the final recommendation",
-  "reasoning": "detailed explanation of why this verdict was reached, referencing the debate",
-  "confidenceScore": 75
-}`;
+  const verdictPrompt = `You are a neutral AI synthesizer. A debate has just concluded.
+Summarize the strongest arguments from each side and give a final recommendation.
+Assign a confidenceScore from 0 to 100 (how clear-cut the answer is).
+Respond ONLY with a JSON object — no extra text, no markdown.
+Schema: { "verdict": "...", "reasoning": "...", "confidenceScore": 75 }`;
 
   let verdictData = null;
-  const generateVerdict = async (strictPrompt = false) => {
-    const promptToUse = strictPrompt 
-      ? verdictPrompt + "\n\nCRITICAL: YOUR PREVIOUS OUTPUT WAS INVALID JSON. YOU MUST RETURN ONLY PURE JSON, NO MARKDOWN, NO TEXT."
-      : verdictPrompt;
 
-    const chat = genai.chats.create({
+  /**
+   * Attempt to get a valid verdict JSON from Ollama.
+   * Uses format:"json" to force structured output (Ollama grammar sampling).
+   * Falls back to regex extraction if the raw text still has JSON buried in it.
+   */
+  const generateVerdict = async () => {
+    const ollamaMessages = [
+      { role: "system", content: verdictPrompt },
+      ...history.map(h => ({
+        role: h.role === "model" ? "assistant" : "user",
+        content: h.parts[0].text
+      })),
+      { role: "user", content: "Provide the final verdict JSON now." }
+    ];
+
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Verdict timeout")), 90000)
+    );
+
+    const resultPromise = ollama.chat({
       model: MODEL,
-      config: {
-        systemInstruction: promptToUse,
-        temperature: 0.2,
-      },
-      history: history.slice(), // Pass the entire debate history
+      messages: ollamaMessages,
+      format: "json",          // ← forces Ollama to grammar-sample valid JSON
+      options: { temperature: 0.1 },
     });
 
-    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 15000));
-    const resultPromise = chat.sendMessage({ message: "Synthesize the debate and provide the final verdict." });
     const result = await Promise.race([resultPromise, timeoutPromise]);
-    
-    let text = result.response.text() || "";
-    
-    // Strip markdown fences if the model included them despite instructions
-    text = text.replace(/^```json/m, '').replace(/^```/m, '').replace(/```$/m, '').trim();
-    
+    let text = (result.message?.content || "").trim();
+
+    // 1st try: direct parse (format:"json" should make this always succeed)
     try {
       return JSON.parse(text);
-    } catch (e) {
-      console.warn("[orchestrator] Failed to parse verdict JSON:", text);
-      return null;
+    } catch (_) {}
+
+    // 2nd try: strip markdown fences then parse
+    text = text.replace(/^```json\s*/m, "").replace(/^```\s*/m, "").replace(/```\s*$/m, "").trim();
+    try {
+      return JSON.parse(text);
+    } catch (_) {}
+
+    // 3rd try: the model output valid JSON but forgot the closing } — append it and retry
+    if (text.startsWith("{") && !text.endsWith("}")) {
+      try { return JSON.parse(text + "}"); } catch (_) {}
     }
+
+    // 4th try: grab first complete {...} block anywhere in the text
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { return JSON.parse(match[0]); } catch (_) {}
+    }
+
+    // 5th try: grab {...} and try appending closing brace
+    const partialMatch = text.match(/\{[\s\S]*/);
+    if (partialMatch) {
+      try { return JSON.parse(partialMatch[0] + "}"); } catch (_) {}
+    }
+
+    // 4th try: build a verdict from the raw text so the user still sees something useful
+    console.warn("[orchestrator] All JSON parse attempts failed, using raw text fallback. Raw:", text);
+    return {
+      verdict: text.slice(0, 200) || "The debate concluded without a clear winner.",
+      reasoning: text.slice(200) || "See verdict above.",
+      confidenceScore: 50,
+    };
   };
 
   try {
-    verdictData = await generateVerdict(false);
-    if (!verdictData) {
-      console.log("[orchestrator] Retrying verdict generation with stricter prompt...");
-      verdictData = await generateVerdict(true);
-    }
-    
-    if (!verdictData) {
-       // Fallback if parsing fails twice
-       verdictData = {
-         verdict: "Debate concluded, but the synthesis could not be properly formatted.",
-         reasoning: "The AI synthesizer failed to return a valid JSON response after multiple attempts.",
-         confidenceScore: null
-       };
-    }
-    
-    // Ensure the shape matches what the frontend expects
+    verdictData = await generateVerdict();
+
     yield {
       type: "verdict",
       payload: {
         verdict: verdictData.verdict || "No verdict provided.",
         reasoning: verdictData.reasoning || "No reasoning provided.",
-        confidenceScore: typeof verdictData.confidenceScore === 'number' ? verdictData.confidenceScore : null
-      }
+        confidenceScore: typeof verdictData.confidenceScore === "number"
+          ? verdictData.confidenceScore
+          : null,
+      },
     };
   } catch (err) {
     console.error("[orchestrator] Verdict synthesis failed:", err.message);
     yield { type: "error", message: "Failed to synthesize verdict: " + err.message };
   }
   
-  yield { type: "agent_end", agentId: "synthesizer" };
   yield { type: "debate_end" };
 }

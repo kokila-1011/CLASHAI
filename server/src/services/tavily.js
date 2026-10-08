@@ -4,8 +4,8 @@
  * Docs: https://docs.tavily.com/docs/rest-api/api-reference
  *
  * Exported:
- *   extractSearchQuery(history, genai) → string
- *     Uses a tiny Gemini call to derive a search-friendly query from the
+ *   extractSearchQuery(history) → string
+ *     Uses a tiny Ollama call to derive a search-friendly query from the
  *     debate transcript so far.  Falls back to a simple heuristic if the
  *     call fails.
  *
@@ -14,22 +14,22 @@
  *     Returns [] on any failure so the caller can degrade gracefully.
  */
 
+import ollama from "ollama";
+
 const TAVILY_ENDPOINT = "https://api.tavily.com/search";
 const MAX_RESULTS = 3;
 
 // ── Query extraction ──────────────────────────────────────────────────────────
 
 /**
- * Ask Gemini to distil the current debate history into a short, search-
+ * Ask Ollama to distil the current debate history into a short, search-
  * friendly query string (≤ 10 words).  Falls back to a heuristic if
- * the Gemini call throws.
+ * the Ollama call throws.
  *
  * @param {Array<{role,parts}>} history   shared debate history so far
- * @param {GoogleGenAI}         genai     already-initialised Gemini client
- * @param {string}              model     model ID to use
  * @returns {Promise<string>}
  */
-export async function extractSearchQuery(history, genai, model) {
+export async function extractSearchQuery(history) {
   // Build a compact transcript (last ~4 turns is enough).
   const recentTurns = history.slice(-4);
   const transcript = recentTurns
@@ -43,16 +43,16 @@ export async function extractSearchQuery(history, genai, model) {
     `Debate excerpt:\n${transcript}\n\nSearch query:`;
 
   try {
-    const result = await genai.models.generateContent({
-      model,
-      contents: [{ role: "user", parts: [{ text: extractPrompt }] }],
-      config: { maxOutputTokens: 30, temperature: 0.2 },
+    const result = await ollama.generate({
+      model: "llama3.2", // matching the default model in orchestrator
+      prompt: extractPrompt,
+      options: { temperature: 0.2 },
     });
-    const raw = result.text?.trim() ?? "";
-    // Strip surrounding quotes if Gemini added them.
+    const raw = result.response?.trim() ?? "";
+    // Strip surrounding quotes if Ollama added them.
     return raw.replace(/^["']|["']$/g, "").trim() || heuristicQuery(history);
   } catch (err) {
-    console.warn("[tavily] extractSearchQuery Gemini call failed:", err.message);
+    console.warn("[tavily] extractSearchQuery Ollama call failed:", err.message);
     return heuristicQuery(history);
   }
 }
