@@ -40,7 +40,8 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
  */
 app.post("/api/debate", async (req, res) => {
   console.log("[server] Received request on /api/debate");
-  const { decision } = req.body;
+  const { decision, rounds } = req.body;
+  const maxRounds = Math.min(Math.max(Number(rounds) || 1, 1), 5); // clamp 1-5
 
   if (!decision || typeof decision !== "string" || !decision.trim()) {
     return res.status(400).json({ error: "Missing or empty `decision` in request body." });
@@ -61,7 +62,7 @@ app.post("/api/debate", async (req, res) => {
   };
 
   try {
-    for await (const event of runDebate(decision.trim())) {
+    for await (const event of runDebate(decision.trim(), maxRounds)) {
       send(event);
       if (event.type === "debate_end" || event.type === "error") break;
     }

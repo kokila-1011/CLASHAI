@@ -37,10 +37,9 @@ import {
   formatSourcesForPrompt,
 } from "./services/tavily.js";
 
-const MAX_ROUNDS = 1;
 const MODEL = "llama3.2"; // 2GB model – smaller and faster than llama3 (4.7GB)
 
-export async function* runDebate(decision) {
+export async function* runDebate(decision, maxRounds = 1) {
 
   // Shared conversation history – grows each turn.
   const history = [];
@@ -51,8 +50,8 @@ export async function* runDebate(decision) {
     parts: [{ text: `The decision under debate is: "${decision}"` }],
   });
 
-  for (let round = 1; round <= MAX_ROUNDS; round++) {
-    yield { type: "round_update", round, maxRounds: MAX_ROUNDS };
+  for (let round = 1; round <= maxRounds; round++) {
+    yield { type: "round_update", round, maxRounds };
     let concludeDebate = false;
 
     for (const agent of AGENTS) {

@@ -55,7 +55,7 @@ export default function App() {
 
         {/* Input */}
         <section className={hasStarted ? "animate-slide-up-fade" : "animate-slide-up-fade [animation-delay:200ms] opacity-0"}>
-          <DecisionInput onSubmit={startDebate} isLoading={isLoading} />
+          <DecisionInput onSubmit={(decision, rounds) => startDebate(decision, rounds)} isLoading={isLoading} />
         </section>
 
         {/* Error banner */}

@@ -43,7 +43,7 @@ export function useDebateStream() {
     setIsLoading(false);
   }, []);
 
-  const startDebate = useCallback(async (decision) => {
+  const startDebate = useCallback(async (decision, rounds = 1) => {
     resetDebate();
     setIsLoading(true);
 
@@ -54,7 +54,7 @@ export function useDebateStream() {
       const response = await fetch(`${SERVER_URL}/api/debate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision }),
+        body: JSON.stringify({ decision, rounds: Math.min(Math.max(Number(rounds) || 1, 1), 5) }),
         signal: controller.signal,
       });
 
