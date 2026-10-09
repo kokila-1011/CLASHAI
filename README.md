@@ -1,6 +1,7 @@
 # ClashAI
 
 > Multi-agent AI decision-debate app — 24h hackathon project.
+> DEMO VIDEO FLOW="https://drive.google.com/drive/folders/1zxPeqavUpiAZ3LNWL5GMBz2O_psMJDo-?usp=sharing"
 
 ## Structure
 
